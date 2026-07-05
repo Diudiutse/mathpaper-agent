@@ -1,10 +1,40 @@
+import argparse
 from pathlib import Path
 
-from search_chunks import search
+from search_chunks import search, DEFAULT_EMBEDDING_MODEL
 
 
-def build_prompt(query: str, top_k: int = 5) -> str:
-    results = search(query, top_k=top_k)
+def build_prompt(
+    query: str,
+    embeddings_path: str,
+    top_k: int = 5,
+    model_name: str = DEFAULT_EMBEDDING_MODEL,
+) -> str:
+    """
+    Build a RAG prompt using the top-k retrieved paper chunks.
+
+    Parameters
+    ----------
+    query:
+        User question.
+    embeddings_path:
+        Path to the chunks_with_embeddings.json file.
+    top_k:
+        Number of relevant chunks to retrieve.
+    model_name:
+        Sentence-transformers model used to embed the query.
+
+    Returns
+    -------
+    str
+        A prompt that can be pasted into ChatGPT or another LLM.
+    """
+    results = search(
+        query=query,
+        embeddings_path=embeddings_path,
+        top_k=top_k,
+        model_name=model_name,
+    )
 
     context_parts = []
 
@@ -13,6 +43,7 @@ def build_prompt(query: str, top_k: int = 5) -> str:
             f"""
 [Chunk {i}]
 ID: {result["id"]}
+Path: {result["path"]}
 Score: {result["score"]:.4f}
 
 {result["text"]}
@@ -45,14 +76,63 @@ Answer:
     return prompt.strip()
 
 
-if __name__ == "__main__":
-    query = input("Ask a question about the paper: ")
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Generate a RAG prompt from retrieved paper chunks."
+    )
 
-    prompt = build_prompt(query, top_k=5)
+    parser.add_argument(
+        "embeddings_path",
+        help="Path to the chunks_with_embeddings.json file.",
+    )
 
-    out_path = Path("data/papers/answer_prompt.md")
+    parser.add_argument(
+        "--query",
+        default=None,
+        help="User question. If omitted, the program will ask interactively.",
+    )
+
+    parser.add_argument(
+        "--top-k",
+        type=int,
+        default=5,
+        help="Number of relevant chunks to retrieve.",
+    )
+
+    parser.add_argument(
+        "--output",
+        default="data/papers/answer_prompt.md",
+        help="Path to save the generated prompt.",
+    )
+
+    parser.add_argument(
+        "--model",
+        default=DEFAULT_EMBEDDING_MODEL,
+        help="Sentence-transformers embedding model name.",
+    )
+
+    args = parser.parse_args()
+
+    if args.query is None:
+        query = input("Ask a question about the paper: ")
+    else:
+        query = args.query
+
+    prompt = build_prompt(
+        query=query,
+        embeddings_path=args.embeddings_path,
+        top_k=args.top_k,
+        model_name=args.model,
+    )
+
+    out_path = Path(args.output)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(prompt, encoding="utf-8")
 
     print("\nPrompt generated successfully.")
     print(f"Saved to: {out_path}")
     print("\nYou can now open this file and paste its content into ChatGPT.")
+
+
+if __name__ == "__main__":
+    main()
