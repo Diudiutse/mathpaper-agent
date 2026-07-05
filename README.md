@@ -8,7 +8,7 @@ This project is currently a minimal local RAG system. It does not require an Ope
 
 ## Features
 
-Current version: `v0.2`
+Current version: `v0.3`
 
 * Extract text from a PDF paper
 * Split the extracted text into overlapping chunks
@@ -17,6 +17,7 @@ Current version: `v0.2`
 * Generate a prompt containing the question and relevant paper excerpts
 * Support arbitrary PDF file paths from the command line
 * Run the full local RAG pipeline with a single command
+* Provide a local Streamlit web interface for uploading PDFs and generating RAG prompts
 
 ## Current Pipeline
 
@@ -34,9 +35,11 @@ PDF
 
 ```text
 mathpaper-agent/
+├── app.py
 ├── data/
-│   └── papers/
-│       └── your_paper.pdf
+│   ├── papers/
+│   │   └── your_paper.pdf
+│   └── uploads/
 ├── src/
 │   ├── read_pdf.py
 │   ├── chunk_text.py
@@ -49,7 +52,7 @@ mathpaper-agent/
 └── requirements.txt
 ```
 
-Generated files such as extracted text, chunks, embeddings, and prompts are ignored by Git.
+Generated files such as extracted text, chunks, embeddings, prompts, uploaded PDFs, and private keys are ignored by Git.
 
 ## Installation
 
@@ -71,7 +74,31 @@ Install dependencies:
 pip install -r requirements.txt
 ```
 
-## Quick Start
+## Quick Start: Web Interface
+
+Run the Streamlit app:
+
+```bash
+streamlit run app.py
+```
+
+Then open the local web page shown by Streamlit, usually:
+
+```text
+http://localhost:8501
+```
+
+In the web interface, you can:
+
+1. Upload a PDF paper
+2. Enter a question
+3. Adjust chunk size, overlap, and top-k retrieval settings
+4. Generate a RAG prompt
+5. Copy the prompt into ChatGPT or another LLM
+
+The generated prompt is grounded in the retrieved paper excerpts.
+
+## Quick Start: Command Line
 
 Put a PDF paper in:
 
@@ -108,15 +135,15 @@ data/papers/test_answer_prompt.md
 
 You can copy the content of this file into ChatGPT or another LLM to get an answer grounded in the retrieved paper excerpts.
 
-## Example
+## Command Line Examples
 
-Run:
+Run the full pipeline with a question:
 
 ```bash
 python src/run_rag.py data/papers/test.pdf --query "What is the main theorem of this paper?"
 ```
 
-To automatically open the generated prompt file with Notepad:
+Automatically open the generated prompt file with Notepad:
 
 ```bash
 python src/run_rag.py data/papers/test.pdf --query "What is the main theorem of this paper?" --open
@@ -188,6 +215,10 @@ Since embeddings are normalized, the dot product between two vectors is used as 
 
 The generated prompt asks the LLM to answer only using the retrieved paper excerpts.
 
+### Web Interface
+
+`app.py` provides a local Streamlit interface. It allows users to upload a PDF, enter a question, run the local RAG pipeline, and view or download the generated prompt.
+
 ## Motivation
 
 Mathematical papers are often long, technical, and highly structured. This project explores how retrieval-based LLM tools can help with mathematical literature reading, theorem lookup, proof dependency analysis, and research note generation.
@@ -200,10 +231,10 @@ Mathematical papers are often long, technical, and highly structured. This proje
 * Support multiple papers in one index
 * Add arXiv metadata search
 * Add BibTeX generation
-* Add a simple web interface
 * Add evaluation examples for mathematical question answering
+* Cache embeddings to avoid recomputing them repeatedly
 * Replace JSON storage with a vector database such as FAISS or Chroma
 
 ## Notes
 
-This project does not upload PDFs, extracted text, embeddings, generated chunks, or private keys to GitHub by default. These files are excluded through `.gitignore`.
+This project does not upload PDFs, extracted text, embeddings, generated chunks, uploaded files, or private keys to GitHub by default. These files are excluded through `.gitignore`.
