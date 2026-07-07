@@ -79,9 +79,13 @@ def save_embeddings(
     chunks_dir: Path,
     embeddings_path: Path,
     model: SentenceTransformer,
+    source_pdf_name: str,
 ) -> int:
     """
     Load chunks, compute embeddings, and save them to a JSON file.
+
+    Each chunk also stores the source PDF name, so that search results
+    can tell us which paper the chunk comes from.
     """
     chunks = load_chunks(str(chunks_dir))
 
@@ -98,6 +102,7 @@ def save_embeddings(
 
     for chunk, embedding in zip(chunks, embeddings):
         chunk["embedding"] = embedding.tolist()
+        chunk["source_pdf"] = source_pdf_name
 
     embeddings_path.write_text(
         json.dumps(chunks, ensure_ascii=False),
@@ -107,103 +112,18 @@ def save_embeddings(
     return len(chunks)
 
 
-def search_with_model(
-    query: str,
-    embeddings_path: Path,
-    model: SentenceTransformer,
-    top_k: int = 5,
-) -> list[dict]:
-    """
-    Search relevant chunks using a cached embedding model.
-    """
-    chunks = json.loads(embeddings_path.read_text(encoding="utf-8"))
-
-    if len(chunks) == 0:
-        raise ValueError(f"No chunks found in {embeddings_path}")
-
-    query_embedding = model.encode(
-        query,
-        normalize_embeddings=True,
-    )
-
-    results = []
-
-    for chunk in chunks:
-        chunk_embedding = np.array(chunk["embedding"])
-
-        # Since embeddings are normalized, dot product equals cosine similarity.
-        score = float(np.dot(query_embedding, chunk_embedding))
-
-        results.append(
-            {
-                "id": chunk["id"],
-                "path": chunk["path"],
-                "score": score,
-                "text": chunk["text"],
-            }
-        )
-
-    results.sort(key=lambda x: x["score"], reverse=True)
-    return results[:top_k]
-
-
-def build_prompt_from_results(query: str, results: list[dict]) -> str:
-    """
-    Build a RAG prompt from retrieved chunks.
-    """
-    context_parts = []
-
-    for i, result in enumerate(results, start=1):
-        context_parts.append(
-            f"""
-[Chunk {i}]
-ID: {result["id"]}
-Path: {result["path"]}
-Score: {result["score"]:.4f}
-
-{result["text"]}
-"""
-        )
-
-    context = "\n\n".join(context_parts)
-
-    prompt = f"""
-You are a careful mathematical research assistant.
-
-Answer the user's question using only the provided paper excerpts.
-
-Rules:
-1. Do not invent facts not supported by the excerpts.
-2. If the excerpts are insufficient, say so clearly.
-3. When possible, refer to the chunk IDs.
-4. Give a mathematically precise answer.
-5. If the question asks about a theorem, lemma, proof, or assumption, identify the exact statement or condition appearing in the excerpts.
-
-User question:
-{query}
-
-Paper excerpts:
-{context}
-
-Answer:
-"""
-
-    return prompt.strip()
-
-
-def run_pipeline(
+def build_document_index(
     pdf_path: Path,
-    query: str,
     chunk_size: int,
     overlap: int,
-    top_k: int,
+    model: SentenceTransformer,
     model_name: str,
     force_rebuild: bool = False,
-) -> tuple[str, dict]:
+) -> dict:
     """
-    Run the local RAG pipeline and return the generated prompt.
+    Build or reuse the local index for one PDF document.
 
-    Cached intermediate files are reused when possible:
+    Cached files are reused when possible:
     - extracted text
     - chunks
     - embeddings
@@ -222,9 +142,6 @@ def run_pipeline(
     embeddings_path = paper_dir / (
         f"{paper_stem}_embeddings_cs{chunk_size}_ov{overlap}_{model_key}.json"
     )
-    prompt_path = paper_dir / f"{paper_stem}_answer_prompt.md"
-
-    model = get_embedding_model(model_name)
 
     used_text_cache = False
     used_chunks_cache = False
@@ -260,38 +177,181 @@ def run_pipeline(
             chunks_dir=chunks_dir,
             embeddings_path=embeddings_path,
             model=model,
+            source_pdf_name=pdf_path.name,
         )
 
-    # Step 4: retrieve relevant chunks for the current query
-    results = search_with_model(
-        query=query,
-        embeddings_path=embeddings_path,
-        model=model,
-        top_k=top_k,
-    )
-
-    # Step 5: build prompt
-    prompt = build_prompt_from_results(
-        query=query,
-        results=results,
-    )
-
-    prompt_path.write_text(prompt, encoding="utf-8")
-
-    info = {
+    return {
+        "pdf_path": pdf_path,
         "text_path": text_path,
         "chunks_dir": chunks_dir,
         "embeddings_path": embeddings_path,
-        "prompt_path": prompt_path,
         "num_characters": len(text),
         "num_chunks": num_chunks,
-        "retrieved_results": results,
         "used_text_cache": used_text_cache,
         "used_chunks_cache": used_chunks_cache,
         "used_embeddings_cache": used_embeddings_cache,
     }
 
+
+def load_all_chunks(document_infos: list[dict]) -> list[dict]:
+    """
+    Load chunks from multiple document embedding files.
+    """
+    all_chunks = []
+
+    for info in document_infos:
+        embeddings_path = info["embeddings_path"]
+        chunks = json.loads(embeddings_path.read_text(encoding="utf-8"))
+
+        for chunk in chunks:
+            if "source_pdf" not in chunk:
+                chunk["source_pdf"] = info["pdf_path"].name
+
+            all_chunks.append(chunk)
+
+    return all_chunks
+
+
+def search_across_documents(
+    query: str,
+    chunks: list[dict],
+    model: SentenceTransformer,
+    top_k: int = 5,
+) -> list[dict]:
+    """
+    Search relevant chunks across multiple documents.
+    """
+    if len(chunks) == 0:
+        raise ValueError("No chunks available for search.")
+
+    query_embedding = model.encode(
+        query,
+        normalize_embeddings=True,
+    )
+
+    results = []
+
+    for chunk in chunks:
+        chunk_embedding = np.array(chunk["embedding"])
+
+        # Since embeddings are normalized, dot product equals cosine similarity.
+        score = float(np.dot(query_embedding, chunk_embedding))
+
+        results.append(
+            {
+                "id": chunk["id"],
+                "path": chunk["path"],
+                "source_pdf": chunk.get("source_pdf", "unknown"),
+                "score": score,
+                "text": chunk["text"],
+            }
+        )
+
+    results.sort(key=lambda x: x["score"], reverse=True)
+
+    return results[:top_k]
+
+
+def build_prompt_from_results(query: str, results: list[dict]) -> str:
+    """
+    Build a RAG prompt from retrieved chunks.
+    """
+    context_parts = []
+
+    for i, result in enumerate(results, start=1):
+        context_parts.append(
+            f"""
+[Chunk {i}]
+Source PDF: {result["source_pdf"]}
+ID: {result["id"]}
+Path: {result["path"]}
+Score: {result["score"]:.4f}
+
+{result["text"]}
+"""
+        )
+
+    context = "\n\n".join(context_parts)
+
+    prompt = f"""
+You are a careful mathematical research assistant.
+
+Answer the user's question using only the provided paper excerpts.
+
+Rules:
+1. Do not invent facts not supported by the excerpts.
+2. If the excerpts are insufficient, say so clearly.
+3. When possible, refer to the source PDF and chunk IDs.
+4. Give a mathematically precise answer.
+5. If the question asks about a theorem, lemma, proof, or assumption, identify the exact statement or condition appearing in the excerpts.
+6. If multiple papers are relevant, compare them clearly.
+
+User question:
+{query}
+
+Paper excerpts:
+{context}
+
+Answer:
+"""
+
+    return prompt.strip()
+
+
+def run_multi_paper_pipeline(
+    pdf_paths: list[Path],
+    query: str,
+    chunk_size: int,
+    overlap: int,
+    top_k: int,
+    model_name: str,
+    force_rebuild: bool = False,
+) -> tuple[str, dict]:
+    """
+    Run the local RAG pipeline over multiple PDF papers.
+    """
+    model = get_embedding_model(model_name)
+
+    document_infos = []
+
+    for pdf_path in pdf_paths:
+        info = build_document_index(
+            pdf_path=pdf_path,
+            chunk_size=chunk_size,
+            overlap=overlap,
+            model=model,
+            model_name=model_name,
+            force_rebuild=force_rebuild,
+        )
+        document_infos.append(info)
+
+    all_chunks = load_all_chunks(document_infos)
+
+    results = search_across_documents(
+        query=query,
+        chunks=all_chunks,
+        model=model,
+        top_k=top_k,
+    )
+
+    prompt = build_prompt_from_results(
+        query=query,
+        results=results,
+    )
+
+    prompt_path = UPLOAD_DIR / "multi_paper_answer_prompt.md"
+    prompt_path.write_text(prompt, encoding="utf-8")
+
+    info = {
+        "document_infos": document_infos,
+        "num_documents": len(document_infos),
+        "num_total_chunks": len(all_chunks),
+        "retrieved_results": results,
+        "prompt_path": prompt_path,
+    }
+
     return prompt, info
+
 
 st.set_page_config(
     page_title="MathPaper-Agent",
@@ -302,17 +362,18 @@ st.set_page_config(
 st.title("MathPaper-Agent")
 st.write(
     "A local RAG prototype for mathematical papers. "
-    "Upload a PDF, ask a question, and generate a prompt grounded in retrieved paper excerpts."
+    "Upload one or more PDFs, ask a question, and generate a prompt grounded in retrieved paper excerpts."
 )
 
-uploaded_file = st.file_uploader(
-    "Upload a PDF paper",
+uploaded_files = st.file_uploader(
+    "Upload PDF papers",
     type=["pdf"],
+    accept_multiple_files=True,
 )
 
 query = st.text_input(
     "Question",
-    placeholder="What is the main theorem of this paper?",
+    placeholder="Which paper discusses Brouwer's conjecture for split graphs?",
 )
 
 with st.expander("Advanced settings"):
@@ -335,8 +396,8 @@ with st.expander("Advanced settings"):
     top_k = st.number_input(
         "Top-k retrieved chunks",
         min_value=1,
-        max_value=20,
-        value=5,
+        max_value=30,
+        value=8,
         step=1,
     )
 
@@ -350,22 +411,23 @@ with st.expander("Advanced settings"):
         value=False,
         help="If checked, the app will recompute text, chunks, and embeddings.",
     )
+
 run_button = st.button("Generate RAG Prompt")
 
 if run_button:
-    if uploaded_file is None:
-        st.error("Please upload a PDF file first.")
+    if not uploaded_files:
+        st.error("Please upload at least one PDF file.")
     elif not query.strip():
         st.error("Please enter a question.")
     elif overlap >= chunk_size:
         st.error("Overlap must be smaller than chunk size.")
     else:
-        with st.spinner("Running local RAG pipeline..."):
+        with st.spinner("Running local multi-paper RAG pipeline..."):
             try:
-                pdf_path = save_uploaded_pdf(uploaded_file)
+                pdf_paths = [save_uploaded_pdf(file) for file in uploaded_files]
 
-                prompt, info = run_pipeline(
-                    pdf_path=pdf_path,
+                prompt, info = run_multi_paper_pipeline(
+                    pdf_paths=pdf_paths,
                     query=query,
                     chunk_size=int(chunk_size),
                     overlap=int(overlap),
@@ -377,21 +439,27 @@ if run_button:
                 st.success("Prompt generated successfully.")
 
                 st.subheader("Pipeline summary")
-                st.write(f"Extracted characters: {info['num_characters']}")
-                st.write(f"Number of chunks: {info['num_chunks']}")
+                st.write(f"Number of documents: {info['num_documents']}")
+                st.write(f"Total number of chunks: {info['num_total_chunks']}")
                 st.write(f"Prompt path: `{info['prompt_path']}`")
 
-                st.write("Cache usage:")
-                st.write(f"- Text cache: {info['used_text_cache']}")
-                st.write(f"- Chunks cache:{info['used_chunks_cache']}")
-                st.write(f"- Embeddings cache:{info['used_embeddings_cache']}")
+                st.subheader("Document cache summary")
+                for doc_info in info["document_infos"]:
+                    with st.expander(f"{doc_info['pdf_path'].name}"):
+                        st.write(f"Extracted characters: {doc_info['num_characters']}")
+                        st.write(f"Number of chunks: {doc_info['num_chunks']}")
+                        st.write(f"Text cache: {doc_info['used_text_cache']}")
+                        st.write(f"Chunks cache: {doc_info['used_chunks_cache']}")
+                        st.write(f"Embeddings cache: {doc_info['used_embeddings_cache']}")
+                        st.write(f"Embeddings path: `{doc_info['embeddings_path']}`")
+
                 st.subheader("Retrieved chunks")
                 for i, result in enumerate(info["retrieved_results"], start=1):
                     with st.expander(
-                        f"Rank {i}: {result['id']} | Score: {result['score']:.4f}"
+                        f"Rank {i}: {result['source_pdf']} | {result['id']} | Score: {result['score']:.4f}"
                     ):
                         st.write(f"Path: `{result['path']}`")
-                        st.text(result["text"][:2000])
+                        st.text(result["text"][:2500])
 
                 st.subheader("Generated prompt")
                 st.text_area(
@@ -403,7 +471,7 @@ if run_button:
                 st.download_button(
                     label="Download prompt",
                     data=prompt,
-                    file_name="answer_prompt.md",
+                    file_name="multi_paper_answer_prompt.md",
                     mime="text/markdown",
                 )
 
