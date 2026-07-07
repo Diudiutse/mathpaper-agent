@@ -1,5 +1,6 @@
 import hashlib
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -14,8 +15,7 @@ SRC_DIR = PROJECT_ROOT / "src"
 sys.path.append(str(SRC_DIR))
 
 from read_pdf import read_pdf
-from chunk_text import chunk_text
-from embed_chunks import load_chunks, DEFAULT_EMBEDDING_MODEL
+from embed_chunks import DEFAULT_EMBEDDING_MODEL
 
 
 UPLOAD_DIR = PROJECT_ROOT / "data" / "uploads"
@@ -54,43 +54,138 @@ def save_uploaded_pdf(uploaded_file) -> Path:
     return pdf_path
 
 
-def save_chunks(text_path: Path, chunks_dir: Path, chunk_size: int, overlap: int) -> int:
+def find_page_markers(text: str) -> list[tuple[int, int]]:
     """
-    Read a text file, split it into chunks, and save chunk files.
-    """
-    text = text_path.read_text(encoding="utf-8")
+    Find page markers like [Page 1] in the extracted text.
 
-    chunks = chunk_text(
-        text,
-        chunk_size=chunk_size,
-        overlap=overlap,
-    )
+    Returns
+    -------
+    list[tuple[int, int]]
+        A list of pairs (character_position, page_number).
+    """
+    markers = []
+
+    for match in re.finditer(r"\[Page (\d+)\]", text):
+        position = match.start()
+        page_number = int(match.group(1))
+        markers.append((position, page_number))
+
+    return markers
+
+
+def estimate_page_range(
+    start: int,
+    end: int,
+    page_markers: list[tuple[int, int]],
+) -> tuple[int | None, int | None]:
+    """
+    Estimate the page range of a text chunk using page marker positions.
+    """
+    if not page_markers:
+        return None, None
+
+    pages_in_range = [
+        page_number
+        for position, page_number in page_markers
+        if start <= position < end
+    ]
+
+    previous_pages = [
+        page_number
+        for position, page_number in page_markers
+        if position <= start
+    ]
+
+    if pages_in_range:
+        page_start = previous_pages[-1] if previous_pages else pages_in_range[0]
+        page_end = pages_in_range[-1]
+    else:
+        page_start = previous_pages[-1] if previous_pages else page_markers[0][1]
+        page_end = page_start
+
+    return page_start, page_end
+
+
+def save_chunks(
+    text_path: Path,
+    chunks_dir: Path,
+    chunk_size: int,
+    overlap: int,
+) -> list[dict]:
+    """
+    Read a text file, split it into chunks, save chunk files,
+    and return metadata for each chunk.
+    """
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be positive.")
+
+    if overlap < 0:
+        raise ValueError("overlap must be non-negative.")
+
+    if overlap >= chunk_size:
+        raise ValueError("overlap must be smaller than chunk_size.")
+
+    text = text_path.read_text(encoding="utf-8")
+    page_markers = find_page_markers(text)
 
     chunks_dir.mkdir(parents=True, exist_ok=True)
 
-    for i, chunk in enumerate(chunks):
-        out_path = chunks_dir / f"chunk_{i:04d}.txt"
-        out_path.write_text(chunk, encoding="utf-8")
+    chunks = []
+    start = 0
+    chunk_id = 0
 
-    return len(chunks)
+    while start < len(text):
+        end = start + chunk_size
+        chunk_text_value = text[start:end]
+
+        page_start, page_end = estimate_page_range(
+            start=start,
+            end=end,
+            page_markers=page_markers,
+        )
+
+        chunk_name = f"chunk_{chunk_id:04d}"
+        out_path = chunks_dir / f"{chunk_name}.txt"
+        out_path.write_text(chunk_text_value, encoding="utf-8")
+
+        chunks.append(
+            {
+                "id": chunk_name,
+                "path": str(out_path),
+                "text": chunk_text_value,
+                "page_start": page_start,
+                "page_end": page_end,
+            }
+        )
+
+        chunk_id += 1
+        start = end - overlap
+
+    metadata_path = chunks_dir / "chunks_metadata.json"
+    metadata_path.write_text(
+        json.dumps(chunks, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    return chunks
 
 
 def save_embeddings(
-    chunks_dir: Path,
+    chunks: list[dict],
     embeddings_path: Path,
     model: SentenceTransformer,
     source_pdf_name: str,
 ) -> int:
     """
-    Load chunks, compute embeddings, and save them to a JSON file.
+    Compute embeddings for chunks and save them to a JSON file.
 
-    Each chunk also stores the source PDF name, so that search results
-    can tell us which paper the chunk comes from.
+    Each chunk stores:
+    - source PDF name
+    - page range
+    - embedding vector
     """
-    chunks = load_chunks(str(chunks_dir))
-
     if len(chunks) == 0:
-        raise ValueError(f"No chunk_*.txt files found in {chunks_dir}")
+        raise ValueError("No chunks available for embedding.")
 
     texts = [chunk["text"] for chunk in chunks]
 
@@ -156,25 +251,27 @@ def build_document_index(
         text_path.write_text(text, encoding="utf-8")
 
     # Step 2: create chunks, or reuse cached chunks
-    existing_chunks = list(chunks_dir.glob("chunk_*.txt"))
+    metadata_path = chunks_dir / "chunks_metadata.json"
 
-    if existing_chunks and not force_rebuild:
-        num_chunks = len(existing_chunks)
+    if metadata_path.exists() and not force_rebuild:
+        chunks = json.loads(metadata_path.read_text(encoding="utf-8"))
+        num_chunks = len(chunks)
         used_chunks_cache = True
     else:
-        num_chunks = save_chunks(
+        chunks = save_chunks(
             text_path=text_path,
             chunks_dir=chunks_dir,
             chunk_size=chunk_size,
             overlap=overlap,
         )
+        num_chunks = len(chunks)
 
     # Step 3: compute embeddings, or reuse cached embeddings
     if embeddings_path.exists() and not force_rebuild:
         used_embeddings_cache = True
     else:
         save_embeddings(
-            chunks_dir=chunks_dir,
+            chunks=chunks,
             embeddings_path=embeddings_path,
             model=model,
             source_pdf_name=pdf_path.name,
@@ -242,6 +339,8 @@ def search_across_documents(
                 "id": chunk["id"],
                 "path": chunk["path"],
                 "source_pdf": chunk.get("source_pdf", "unknown"),
+                "page_start": chunk.get("page_start"),
+                "page_end": chunk.get("page_end"),
                 "score": score,
                 "text": chunk["text"],
             }
@@ -252,6 +351,22 @@ def search_across_documents(
     return results[:top_k]
 
 
+def format_page_range(result: dict) -> str:
+    """
+    Format page range for display.
+    """
+    page_start = result.get("page_start")
+    page_end = result.get("page_end")
+
+    if page_start is None:
+        return "unknown"
+
+    if page_start == page_end:
+        return str(page_start)
+
+    return f"{page_start}-{page_end}"
+
+
 def build_prompt_from_results(query: str, results: list[dict]) -> str:
     """
     Build a RAG prompt from retrieved chunks.
@@ -259,10 +374,13 @@ def build_prompt_from_results(query: str, results: list[dict]) -> str:
     context_parts = []
 
     for i, result in enumerate(results, start=1):
+        page_text = format_page_range(result)
+
         context_parts.append(
             f"""
 [Chunk {i}]
 Source PDF: {result["source_pdf"]}
+Pages: {page_text}
 ID: {result["id"]}
 Path: {result["path"]}
 Score: {result["score"]:.4f}
@@ -281,7 +399,7 @@ Answer the user's question using only the provided paper excerpts.
 Rules:
 1. Do not invent facts not supported by the excerpts.
 2. If the excerpts are insufficient, say so clearly.
-3. When possible, refer to the source PDF and chunk IDs.
+3. When possible, refer to the source PDF, page range, and chunk IDs.
 4. Give a mathematically precise answer.
 5. If the question asks about a theorem, lemma, proof, or assumption, identify the exact statement or condition appearing in the excerpts.
 6. If multiple papers are relevant, compare them clearly.
@@ -339,6 +457,7 @@ def run_multi_paper_pipeline(
         results=results,
     )
 
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     prompt_path = UPLOAD_DIR / "multi_paper_answer_prompt.md"
     prompt_path.write_text(prompt, encoding="utf-8")
 
@@ -451,13 +570,20 @@ if run_button:
                         st.write(f"Text cache: {doc_info['used_text_cache']}")
                         st.write(f"Chunks cache: {doc_info['used_chunks_cache']}")
                         st.write(f"Embeddings cache: {doc_info['used_embeddings_cache']}")
+                        st.write(f"Text path: `{doc_info['text_path']}`")
+                        st.write(f"Chunks dir: `{doc_info['chunks_dir']}`")
                         st.write(f"Embeddings path: `{doc_info['embeddings_path']}`")
 
                 st.subheader("Retrieved chunks")
                 for i, result in enumerate(info["retrieved_results"], start=1):
+                    page_text = format_page_range(result)
+
                     with st.expander(
-                        f"Rank {i}: {result['source_pdf']} | {result['id']} | Score: {result['score']:.4f}"
+                        f"Rank {i}: {result['source_pdf']} | Pages {page_text} | "
+                        f"{result['id']} | Score: {result['score']:.4f}"
                     ):
+                        st.write(f"Source PDF: `{result['source_pdf']}`")
+                        st.write(f"Pages: `{page_text}`")
                         st.write(f"Path: `{result['path']}`")
                         st.text(result["text"][:2500])
 
